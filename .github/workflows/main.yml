@@ -1,7 +1,7 @@
 on:
   push:
     branches:
-      - main
+      - main-workflow
 
 name: Package
 
@@ -24,31 +24,31 @@ jobs:
         aws-region: us-east-1
         
     - name: Login to Amazon ECR private without setting mask-password -> mask credential
-      uses: aws-actions/amazon-ecr-login@v1.7.1
+      uses: aws-actions/amazon-ecr-login@v2
 
     - name: Login to Amazon ECR public without setting mask-password -> mask credential
-      uses: aws-actions/amazon-ecr-login@v1.7.1
+      uses: aws-actions/amazon-ecr-login@v2
       with:
         registry-type: public
     
     - name: Login to Amazon ECR private with mask-password = true -> mask credential
-      uses: aws-actions/amazon-ecr-login@v1.7.1
+      uses: aws-actions/amazon-ecr-login@v2
       with:
         mask-password: true
 
     - name: Login to Amazon ECR public with mask-password = true -> mask credential
-      uses: aws-actions/amazon-ecr-login@v1.7.1
+      uses: aws-actions/amazon-ecr-login@v2
       with:
         registry-type: public
         mask-password: true
     
     - name: Login to Amazon ECR private with mask-password = false -> NOT mask credential
-      uses: aws-actions/amazon-ecr-login@v1.7.1
+      uses: aws-actions/amazon-ecr-login@v2
       with:
         mask-password: false
 
     - name: Login to Amazon ECR public with mask-password = false -> NOT mask credential
-      uses: aws-actions/amazon-ecr-login@v1.7.1
+      uses: aws-actions/amazon-ecr-login@v2
       with:
         registry-type: public
         mask-password: false
