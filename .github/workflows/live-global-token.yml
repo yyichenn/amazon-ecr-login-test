@@ -106,11 +106,17 @@ jobs:
             node .github/scripts/registry-probe.mjs
           fi
 
-      - name: Login with global token to cross-region registry
+      - name: Configure AWS credentials for cross-region registry
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::277125094980:role/ecr-login-gha-live-test-matrix-20261111
+          aws-region: us-east-1
+
+      - name: Login with global token in configured cross region
         id: cross_region
         uses: ./
         with:
-          registry-endpoints: 277125094980.dkr.ecr.us-east-1.amazonaws.com
+          registries: 277125094980
           ecr-private-token-type: global-token
 
       - name: Verify global token cross region
@@ -127,32 +133,6 @@ jobs:
             docker pull "$REGISTRY/$REPOSITORY:$TAG"
           else
             node .github/scripts/registry-probe.mjs
-          fi
-
-      - name: Login once to same-region and cross-region registries
-        id: two_registries
-        uses: ./
-        with:
-          registry-endpoints: >-
-            277125094980.dkr.ecr.us-west-2.amazonaws.com,
-            277125094980.dkr.ecr.us-east-1.amazonaws.com
-          ecr-private-token-type: global-token
-
-      - name: Verify both registries from one login
-        shell: bash
-        env:
-          EXPECT: success
-          WEST_USER: ${{ steps.two_registries.outputs.docker_username_277125094980_dkr_ecr_us_west_2_amazonaws_com }}
-          WEST_PASSWORD: ${{ steps.two_registries.outputs.docker_password_277125094980_dkr_ecr_us_west_2_amazonaws_com }}
-          EAST_USER: ${{ steps.two_registries.outputs.docker_username_277125094980_dkr_ecr_us_east_1_amazonaws_com }}
-          EAST_PASSWORD: ${{ steps.two_registries.outputs.docker_password_277125094980_dkr_ecr_us_east_1_amazonaws_com }}
-        run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            docker pull "$WEST_REGISTRY/$WEST_REPOSITORY:$WEST_TAG"
-            docker pull "$EAST_REGISTRY/$EAST_REPOSITORY:$EAST_TAG"
-          else
-            REGISTRY="$WEST_REGISTRY" REPOSITORY="$WEST_REPOSITORY" TAG="$WEST_TAG" ECR_USER="$WEST_USER" ECR_PASSWORD="$WEST_PASSWORD" node .github/scripts/registry-probe.mjs
-            REGISTRY="$EAST_REGISTRY" REPOSITORY="$EAST_REPOSITORY" TAG="$EAST_TAG" ECR_USER="$EAST_USER" ECR_PASSWORD="$EAST_PASSWORD" node .github/scripts/registry-probe.mjs
           fi
 
       - name: Cross-account global token

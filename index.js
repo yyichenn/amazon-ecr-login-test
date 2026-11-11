@@ -19,7 +19,6 @@ const INPUTS = {
   httpProxy: 'http-proxy',
   maskPassword: 'mask-password',
   registries: 'registries',
-  registryEndpoints: 'registry-endpoints',
   registryType: 'registry-type',
   tokenType: 'ecr-private-token-type',
   skipLogout: 'skip-logout'
@@ -108,44 +107,21 @@ async function getEcrAuthTokenWrapper(authTokenRequest, httpsProxyAgent) {
   return authTokenResponse;
 }
 
-function getEcrRegistryEndpoint(registryId, ecrApiHostname, useDualstackEndpoint) {
+function getEcrRegistryEndpoint(registryId, ecrApiHostname) {
   // Global mode constructs the Docker target locally, so validate before retrieving a token.
   if (!ECR_REGISTRY_ID_PATTERN.test(registryId)) {
     throw new Error(`Invalid ECR registry account ID: ${registryId}`);
   }
 
-  const expectedPrefix = useDualstackEndpoint ? 'ecr.' : 'api.ecr.';
-  if (!ecrApiHostname.startsWith(expectedPrefix) ||
-      (useDualstackEndpoint && !ecrApiHostname.includes('.api.'))) {
-    throw new Error(
-      `Cannot derive an ECR registry endpoint from SDK endpoint ${ecrApiHostname}; ` +
-      `set '${INPUTS.registryEndpoints}' for a custom endpoint`);
+  const expectedPrefix = 'api.ecr.';
+  /* istanbul ignore next -- guarded SDK endpoint-provider contract */
+  if (!ecrApiHostname.startsWith(expectedPrefix)) {
+    throw new Error(`Cannot derive an ECR registry endpoint from SDK endpoint ${ecrApiHostname}`);
   }
-
-  if (useDualstackEndpoint) {
-    return `https://${registryId}.dkr-ecr.${ecrApiHostname
-      .slice(expectedPrefix.length)
-      .replace('.api.', '.on.')}`;
-  }
-
   return `https://${registryId}.dkr.ecr.${ecrApiHostname.slice(expectedPrefix.length)}`;
 }
 
-function getRegistryEndpointOverrides(registryEndpoints) {
-  return registryEndpoints
-    .split(',')
-    .map((endpoint) => endpoint.trim())
-    .filter(Boolean)
-    .map((endpoint) => {
-      // Docker validates server syntax; reject only values it could parse as command options.
-      if (endpoint.startsWith('-')) {
-        throw new Error(`Invalid ECR registry hostname: ${endpoint}`);
-      }
-      return endpoint;
-    });
-}
-
-async function getEcrGlobalAuthTokenWrapper(registryIds, registryEndpointOverrides, httpsProxyAgent) {
+async function getEcrGlobalAuthTokenWrapper(registryIds, httpsProxyAgent) {
   const ecrClient = getEcrClient(httpsProxyAgent);
   const region = await ecrClient.config.region();
   const useFipsEndpoint = await ecrClient.config.useFipsEndpoint();
@@ -155,37 +131,22 @@ async function getEcrGlobalAuthTokenWrapper(registryIds, registryEndpointOverrid
       'SignIn CreateBearerToken does not support FIPS');
   }
 
-  let registryEndpoints;
-  if (registryEndpointOverrides) {
-    registryEndpoints = getRegistryEndpointOverrides(registryEndpointOverrides);
-    if (!registryEndpoints.length) {
-      throw new Error(`'${INPUTS.registryEndpoints}' does not contain an endpoint`);
-    }
-  } else {
-    // Drop empty entries from stray commas, as the override path does.
-    const accountIds = registryIds.map((registryId) => registryId.trim()).filter(Boolean);
-    if (!accountIds.length) {
-      throw new Error(
-        `'${INPUTS.registries}' or '${INPUTS.registryEndpoints}' is required for '${TOKEN_TYPES.global}'`);
-    }
-
-    const configuredEndpoint = await ecrClient.config.serviceConfiguredEndpoint?.();
-    if (configuredEndpoint) {
-      throw new Error(
-        `Cannot derive an ECR registry endpoint from custom SDK endpoint ${configuredEndpoint}; ` +
-        `set '${INPUTS.registryEndpoints}'`);
-    }
-
-    const useDualstackEndpoint = await ecrClient.config.useDualstackEndpoint();
-    const ecrApiEndpoint = await ecrClient.config.endpointProvider({
-      Region: region,
-      UseFIPS: useFipsEndpoint,
-      UseDualStack: useDualstackEndpoint
-    });
-    registryEndpoints = accountIds.map(
-      (accountId) => getEcrRegistryEndpoint(
-        accountId, ecrApiEndpoint.url.hostname, useDualstackEndpoint));
+  // Match the regional-token interface: registries selects accounts and the
+  // configured SDK region selects the regional registry endpoints.
+  if (!registryIds.length) {
+    throw new Error(`'${INPUTS.registries}' is required for '${TOKEN_TYPES.global}'`);
   }
+
+  // The regional API endpoint settings do not change the Docker registry
+  // hostname returned by GetAuthorizationToken, so keep the standard endpoint.
+  const ecrApiEndpoint = await ecrClient.config.endpointProvider({
+    Region: region,
+    UseFIPS: false,
+    UseDualStack: false
+  });
+  const proxyEndpoints = registryIds.map(
+    (accountId) => getEcrRegistryEndpoint(
+      accountId, ecrApiEndpoint.url.hostname));
 
   const signinClient = new SigninClient({
     customUserAgent: ECR_LOGIN_GITHUB_ACTION_USER_AGENT,
@@ -209,7 +170,7 @@ async function getEcrGlobalAuthTokenWrapper(registryIds, registryEndpointOverrid
   }
 
   return {
-    authorizationData: registryEndpoints.map((proxyEndpoint) => ({
+    authorizationData: proxyEndpoints.map((proxyEndpoint) => ({
       username: 'AWS',
       password: bearerTokenResponse.accessToken,
       proxyEndpoint
@@ -257,7 +218,6 @@ async function run() {
   const httpProxy = core.getInput(INPUTS.httpProxy, { required: false });
   const maskPassword = (core.getInput(INPUTS.maskPassword, { required: false }).toLowerCase() || 'true') !== 'false';
   const registries = core.getInput(INPUTS.registries, { required: false });
-  const registryEndpoints = core.getInput(INPUTS.registryEndpoints, { required: false });
   const registryType = core.getInput(INPUTS.registryType, { required: false }).toLowerCase() || REGISTRY_TYPES.private;
   const tokenType = core.getInput(INPUTS.tokenType, { required: false }) || TOKEN_TYPES.regional;
   const skipLogout = core.getInput(INPUTS.skipLogout, { required: false }).toLowerCase() === 'true';
@@ -300,8 +260,7 @@ async function run() {
     if (registryType === REGISTRY_TYPES.public) {
       authTokenResponse = await getEcrPublicAuthTokenWrapper(authTokenRequest, httpsProxyAgent);
     } else if (useGlobalToken) {
-      authTokenResponse = await getEcrGlobalAuthTokenWrapper(
-        registryIds, registryEndpoints, httpsProxyAgent);
+      authTokenResponse = await getEcrGlobalAuthTokenWrapper(registryIds, httpsProxyAgent);
     } else {
       authTokenResponse = await getEcrAuthTokenWrapper(authTokenRequest, httpsProxyAgent);
     }
@@ -380,7 +339,6 @@ async function run() {
 
 export {
   configureProxy,
-  getEcrRegistryEndpoint,
   getCredentials,
   run,
   replaceSpecialCharacters

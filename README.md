@@ -236,7 +236,6 @@ Set `ecr-private-token-type: global-token` explicitly to use a global token for 
 
 * `registries` is required; the default registry is not assumed.
 * FIPS endpoints are not supported.
-* For a custom ECR endpoint, list the registry hostnames in `registry-endpoints` instead of `registries`. The global token is sent to each of these hosts, so set only trusted registry hostnames.
 
 The input does not apply to ECR Public.
 
