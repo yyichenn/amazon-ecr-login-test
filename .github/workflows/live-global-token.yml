@@ -1,5 +1,5 @@
 # Test-only workflow; manually dispatched from the isolated branch.
-name: Live ECR global token
+name: Live ECR global token matrix
 
 on:
   workflow_dispatch:
@@ -10,11 +10,19 @@ permissions:
 
 jobs:
   live-test:
-    name: GitHub-hosted runner live test
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     env:
-      ECR_REGISTRY: 277125094980.dkr.ecr.us-west-2.amazonaws.com
-      ECR_IMAGE: 277125094980.dkr.ecr.us-west-2.amazonaws.com/repro-k8s-global-token-cross-region-20261008:repro-global-token-20261008
+      WEST_REGISTRY: 277125094980.dkr.ecr.us-west-2.amazonaws.com
+      WEST_REPOSITORY: repro-k8s-global-token-cross-region-20261008
+      WEST_TAG: repro-global-token-20261008
+      EAST_REGISTRY: 277125094980.dkr.ecr.us-east-1.amazonaws.com
+      EAST_REPOSITORY: repro-createbearertoken-20261014
+      EAST_TAG: validation-20261014t1849z
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -25,54 +33,118 @@ jobs:
           node-version: '24'
 
       - name: Build action
+        shell: bash
         run: npm ci && npm run package
 
       - name: Configure AWS credentials through OIDC
         uses: aws-actions/configure-aws-credentials@v6.3.0
         with:
-          role-to-assume: arn:aws:iam::277125094980:role/ecr-login-gha-live-test-20261111
+          role-to-assume: arn:aws:iam::277125094980:role/ecr-login-gha-live-test-matrix-20261111
           aws-region: us-west-2
 
-      - name: 'Control: pull without login must fail'
-        id: control_pull
-        continue-on-error: true
-        run: docker pull "$ECR_IMAGE"
-
-      - name: Assert control pull failed
-        if: always()
+      - name: Control without login must fail
+        shell: bash
         env:
-          CONTROL_OUTCOME: ${{ steps.control_pull.outcome }}
-        run: |
-          if [ "$CONTROL_OUTCOME" != "failure" ]; then
-            echo "Expected the pull without Docker login to fail; outcome was $CONTROL_OUTCOME." >&2
-            exit 1
-          fi
-
-      - name: Logout after control
-        if: always()
-        run: docker logout "$ECR_REGISTRY" || true
+          EXPECT: failure
+          REGISTRY: ${{ env.WEST_REGISTRY }}
+          REPOSITORY: ${{ env.WEST_REPOSITORY }}
+          TAG: ${{ env.WEST_TAG }}
+        run: node .github/scripts/registry-probe.mjs
 
       - name: Login with default regional token
+        id: regional
         uses: ./
         with:
           registries: 277125094980
 
-      - name: Pull with default regional token
-        run: docker pull "$ECR_IMAGE"
-
-      - name: Logout after default regional token
-        if: always()
-        run: docker logout "$ECR_REGISTRY" || true
+      - name: Verify default regional token
+        shell: bash
+        env:
+          EXPECT: success
+          REGISTRY: ${{ env.WEST_REGISTRY }}
+          REPOSITORY: ${{ env.WEST_REPOSITORY }}
+          TAG: ${{ env.WEST_TAG }}
+          ECR_USER: ${{ steps.regional.outputs.docker_username_277125094980_dkr_ecr_us_west_2_amazonaws_com }}
+          ECR_PASSWORD: ${{ steps.regional.outputs.docker_password_277125094980_dkr_ecr_us_west_2_amazonaws_com }}
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            docker pull "$REGISTRY/$REPOSITORY:$TAG"
+          else
+            node .github/scripts/registry-probe.mjs
+          fi
 
       - name: Login with global token
+        id: global
         uses: ./
         with:
           registries: 277125094980
           ecr-private-token-type: global-token
 
-      - name: Pull with global token
-        run: docker pull "$ECR_IMAGE"
+      - name: Verify global token
+        shell: bash
+        env:
+          EXPECT: success
+          REGISTRY: ${{ env.WEST_REGISTRY }}
+          REPOSITORY: ${{ env.WEST_REPOSITORY }}
+          TAG: ${{ env.WEST_TAG }}
+          ECR_USER: ${{ steps.global.outputs.docker_username_277125094980_dkr_ecr_us_west_2_amazonaws_com }}
+          ECR_PASSWORD: ${{ steps.global.outputs.docker_password_277125094980_dkr_ecr_us_west_2_amazonaws_com }}
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            docker pull "$REGISTRY/$REPOSITORY:$TAG"
+          else
+            node .github/scripts/registry-probe.mjs
+          fi
 
-      - name: Logout after global token
-        if: always()
-        run: docker logout "$ECR_REGISTRY" || true
+      - name: Login with global token to cross-region registry
+        id: cross_region
+        uses: ./
+        with:
+          registry-endpoints: 277125094980.dkr.ecr.us-east-1.amazonaws.com
+          ecr-private-token-type: global-token
+
+      - name: Verify global token cross region
+        shell: bash
+        env:
+          EXPECT: success
+          REGISTRY: ${{ env.EAST_REGISTRY }}
+          REPOSITORY: ${{ env.EAST_REPOSITORY }}
+          TAG: ${{ env.EAST_TAG }}
+          ECR_USER: ${{ steps.cross_region.outputs.docker_username_277125094980_dkr_ecr_us_east_1_amazonaws_com }}
+          ECR_PASSWORD: ${{ steps.cross_region.outputs.docker_password_277125094980_dkr_ecr_us_east_1_amazonaws_com }}
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            docker pull "$REGISTRY/$REPOSITORY:$TAG"
+          else
+            node .github/scripts/registry-probe.mjs
+          fi
+
+      - name: Login once to same-region and cross-region registries
+        id: two_registries
+        uses: ./
+        with:
+          registry-endpoints: >-
+            277125094980.dkr.ecr.us-west-2.amazonaws.com,
+            277125094980.dkr.ecr.us-east-1.amazonaws.com
+          ecr-private-token-type: global-token
+
+      - name: Verify both registries from one login
+        shell: bash
+        env:
+          EXPECT: success
+          WEST_USER: ${{ steps.two_registries.outputs.docker_username_277125094980_dkr_ecr_us_west_2_amazonaws_com }}
+          WEST_PASSWORD: ${{ steps.two_registries.outputs.docker_password_277125094980_dkr_ecr_us_west_2_amazonaws_com }}
+          EAST_USER: ${{ steps.two_registries.outputs.docker_username_277125094980_dkr_ecr_us_east_1_amazonaws_com }}
+          EAST_PASSWORD: ${{ steps.two_registries.outputs.docker_password_277125094980_dkr_ecr_us_east_1_amazonaws_com }}
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            docker pull "$WEST_REGISTRY/$WEST_REPOSITORY:$WEST_TAG"
+            docker pull "$EAST_REGISTRY/$EAST_REPOSITORY:$EAST_TAG"
+          else
+            REGISTRY="$WEST_REGISTRY" REPOSITORY="$WEST_REPOSITORY" TAG="$WEST_TAG" ECR_USER="$WEST_USER" ECR_PASSWORD="$WEST_PASSWORD" node .github/scripts/registry-probe.mjs
+            REGISTRY="$EAST_REGISTRY" REPOSITORY="$EAST_REPOSITORY" TAG="$EAST_TAG" ECR_USER="$EAST_USER" ECR_PASSWORD="$EAST_PASSWORD" node .github/scripts/registry-probe.mjs
+          fi
+
+      - name: Cross-account global token
+        shell: bash
+        run: echo "NOT RUN - repository is in account 365642090993 and its existing policy does not grant this OIDC role; no other-account policy was changed."
