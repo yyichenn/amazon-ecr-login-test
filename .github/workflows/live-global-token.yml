@@ -32,6 +32,16 @@ jobs:
         with:
           node-version: '24'
 
+      - name: Install Docker login shim where Docker CLI is unavailable
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          shim_dir="$RUNNER_TEMP/ecr-login-docker-shim"
+          mkdir -p "$shim_dir"
+          cp .github/scripts/docker-login-shim "$shim_dir/docker"
+          chmod 700 "$shim_dir/docker"
+          echo "$shim_dir" >> "$GITHUB_PATH"
+
       - name: Build action
         shell: bash
         run: npm ci && npm run package

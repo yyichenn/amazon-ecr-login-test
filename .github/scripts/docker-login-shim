@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "${1:-}" in
+  login)
+    IFS= read -r password
+    test -n "$password"
+    ;;
+  logout)
+    ;;
+  *)
+    echo "Unsupported docker shim command" >&2
+    exit 2
+    ;;
+esac
