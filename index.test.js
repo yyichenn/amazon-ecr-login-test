@@ -2,6 +2,7 @@ import { jest } from '@jest/globals';
 import { mockClient } from 'aws-sdk-client-mock';
 import { ECRClient, GetAuthorizationTokenCommand } from '@aws-sdk/client-ecr';
 import { ECRPUBLICClient, GetAuthorizationTokenCommand as GetAuthorizationTokenCommandPublic } from '@aws-sdk/client-ecr-public';
+import { SigninClient, CreateBearerTokenCommand } from '@aws-sdk/client-signin';
 
 jest.unstable_mockModule('@actions/core', () => ({
   getInput: jest.fn(),
@@ -22,7 +23,7 @@ jest.unstable_mockModule('@actions/exec', () => ({
 
 const core = await import('@actions/core');
 const exec = await import('@actions/exec');
-const { run, replaceSpecialCharacters, configureProxy } = await import('./index.js');
+const { run, replaceSpecialCharacters, configureProxy, getEcrRegistryEndpoint } = await import('./index.js');
 
 function mockGetInput(requestResponse) {
   return function (name, options) { // eslint-disable-line no-unused-vars
@@ -34,7 +35,9 @@ const ECR_DEFAULT_INPUTS = {
   'http-proxy': '',
   'mask-password': '',
   'registries': '',
+  'registry-endpoints': '',
   'registry-type': '',
+  'ecr-private-token-type': '',
   'skip-logout': ''
 };
 
@@ -42,7 +45,9 @@ const ECR_PUBLIC_DEFAULT_INPUTS = {
   'http-proxy': '',
   'mask-password': '',
   'registries': '',
+  'registry-endpoints': '',
   'registry-type': 'public',
+  'ecr-private-token-type': '',
   'skip-logout': ''
 };
 
@@ -63,16 +68,57 @@ const defaultOutputToken = {
 
 const ecrMock = mockClient(ECRClient);
 const ecrPublicMock = mockClient(ECRPUBLICClient);
+const signinMock = mockClient(SigninClient);
+
+// SDK settings that change endpoint resolution. The private registry tests control them
+// and restore the caller's values afterwards, so they neither leak nor depend on the host.
+const AWS_SDK_TEST_ENV_VARS = [
+  'AWS_REGION',
+  'AWS_CONFIG_FILE',
+  'AWS_USE_DUALSTACK_ENDPOINT',
+  'AWS_USE_FIPS_ENDPOINT',
+  'AWS_ENDPOINT_URL',
+  'AWS_ENDPOINT_URL_ECR',
+  'AWS_IGNORE_CONFIGURED_ENDPOINT_URLS'
+];
+
+function saveEnv(names) {
+  return Object.fromEntries(names.map((name) => [name, process.env[name]]));
+}
+
+function restoreEnv(savedEnv) {
+  for (const [name, value] of Object.entries(savedEnv)) {
+    if (value === undefined) {
+      delete process.env[name];
+    } else {
+      process.env[name] = value;
+    }
+  }
+}
 
 describe('Login to ECR', () => {
+  let savedEnv;
+
   beforeEach(() => {
     jest.clearAllMocks();
 
     core.getInput.mockImplementation(mockGetInput(ECR_DEFAULT_INPUTS));
 
     ecrMock.reset();
+    signinMock.reset();
+
+    savedEnv = saveEnv(AWS_SDK_TEST_ENV_VARS);
+    for (const name of AWS_SDK_TEST_ENV_VARS) {
+      delete process.env[name];
+    }
+    process.env.AWS_REGION = 'us-west-2';
+    process.env.AWS_CONFIG_FILE = '/nonexistent/amazon-ecr-login-test/config';
 
     exec.exec.mockReturnValue(0);
+  });
+
+  afterEach(() => {
+    restoreEnv(savedEnv);
   });
 
   test('gets auth token from ECR and logins the Docker client for the default registry', async () => {
@@ -90,6 +136,317 @@ describe('Login to ECR', () => {
     expect(exec.exec).toHaveBeenCalledTimes(1);
     expect(core.setOutput).toHaveBeenCalledTimes(3);
     expect(core.saveState).toHaveBeenCalledTimes(1);
+    expect(signinMock.calls()).toHaveLength(0);
+  });
+
+  test('uses the regional token flow when regional-token is explicit', async () => {
+    core.getInput.mockImplementation(mockGetInput({
+      ...ECR_DEFAULT_INPUTS,
+      'registries': '123456789012',
+      'ecr-private-token-type': 'regional-token'
+    }));
+    ecrMock.on(GetAuthorizationTokenCommand).resolves(defaultOutputToken);
+
+    await run();
+
+    expect(ecrMock.commandCalls(GetAuthorizationTokenCommand, {
+      registryIds: ['123456789012']
+    })).toHaveLength(1);
+    expect(core.debug).toHaveBeenCalledWith('Requesting auth token for 1 registries:');
+    expect(signinMock.calls()).toHaveLength(0);
+  });
+
+  test('passes the raw global token to Docker and the credential output', async () => {
+    core.getInput.mockImplementation(mockGetInput({
+      ...ECR_DEFAULT_INPUTS,
+      'mask-password': 'false',
+      'registries': '123456789012',
+      'ecr-private-token-type': 'global-token'
+    }));
+    signinMock.on(CreateBearerTokenCommand).callsFake(async (input, getClient) => {
+      expect(await getClient().config.region()).toBe('us-west-2');
+      return { accessToken: 'raw:global-token' };
+    });
+
+    await run();
+
+    expect(ecrMock.calls()).toHaveLength(0);
+    expect(signinMock.commandCalls(CreateBearerTokenCommand, {
+      grantType: 'client_credentials',
+      resource: 'ecr.amazonaws.com'
+    })).toHaveLength(1);
+    expect(exec.exec).toHaveBeenCalledWith(
+      'docker',
+      ['login', '-u', 'AWS', '--password-stdin', 'https://123456789012.dkr.ecr.us-west-2.amazonaws.com'],
+      expect.objectContaining({ input: Buffer.from('raw:global-token\n') }));
+    expect(core.setOutput).toHaveBeenCalledWith(
+      'docker_username_123456789012_dkr_ecr_us_west_2_amazonaws_com',
+      'AWS');
+    expect(core.setOutput).toHaveBeenCalledWith(
+      'docker_password_123456789012_dkr_ecr_us_west_2_amazonaws_com',
+      'raw:global-token');
+    expect(core.debug).toHaveBeenCalledWith('Preparing login for 1 registries:');
+    expect(core.setSecret).not.toHaveBeenCalled();
+  });
+
+  test('masks the global token before Docker login', async () => {
+    core.getInput.mockImplementation(mockGetInput({
+      ...ECR_DEFAULT_INPUTS,
+      'registries': '123456789012',
+      'ecr-private-token-type': 'global-token'
+    }));
+    signinMock.on(CreateBearerTokenCommand).resolves({ accessToken: 'global-token' });
+
+    await run();
+
+    expect(core.setSecret).toHaveBeenCalledTimes(1);
+    expect(core.setSecret).toHaveBeenCalledWith('global-token');
+    expect(exec.exec).toHaveBeenCalledTimes(1);
+    expect(core.setSecret.mock.invocationCallOrder[0])
+      .toBeLessThan(exec.exec.mock.invocationCallOrder[0]);
+  });
+
+  test('maps the SDK dual-stack endpoint to the registry hostname', async () => {
+    process.env.AWS_USE_DUALSTACK_ENDPOINT = 'true';
+    core.getInput.mockImplementation(mockGetInput({
+      ...ECR_DEFAULT_INPUTS,
+      'registries': '123456789012',
+      'ecr-private-token-type': 'global-token'
+    }));
+    signinMock.on(CreateBearerTokenCommand).resolves({ accessToken: 'global-token' });
+
+    await run();
+
+    expect(exec.exec).toHaveBeenCalledWith(
+      'docker',
+      ['login', '-u', 'AWS', '--password-stdin', 'https://123456789012.dkr-ecr.us-west-2.on.aws'],
+      expect.objectContaining({ input: Buffer.from('global-token\n') }));
+  });
+
+  test.each([
+    ['registry.example.com', false],
+    ['ecr.us-west-2.example.com', true]
+  ])('rejects unexpected SDK endpoint hostname %s', (hostname, useDualstackEndpoint) => {
+    expect(() => getEcrRegistryEndpoint(
+      '123456789012', hostname, useDualstackEndpoint)).toThrow(
+      `Cannot derive an ECR registry endpoint from SDK endpoint ${hostname}; ` +
+      "set 'registry-endpoints' for a custom endpoint");
+  });
+
+  test('uses one global token for every requested registry', async () => {
+    core.getInput.mockImplementation(mockGetInput({
+      ...ECR_DEFAULT_INPUTS,
+      'registries': '123456789012,111111111111',
+      'ecr-private-token-type': 'global-token'
+    }));
+    signinMock.on(CreateBearerTokenCommand).resolves({ accessToken: 'global-token' });
+
+    await run();
+
+    expect(signinMock.commandCalls(CreateBearerTokenCommand)).toHaveLength(1);
+    expect(exec.exec).toHaveBeenNthCalledWith(
+      1,
+      'docker',
+      ['login', '-u', 'AWS', '--password-stdin', 'https://123456789012.dkr.ecr.us-west-2.amazonaws.com'],
+      expect.objectContaining({ input: Buffer.from('global-token\n') }));
+    expect(exec.exec).toHaveBeenNthCalledWith(
+      2,
+      'docker',
+      ['login', '-u', 'AWS', '--password-stdin', 'https://111111111111.dkr.ecr.us-west-2.amazonaws.com'],
+      expect.objectContaining({ input: Buffer.from('global-token\n') }));
+  });
+
+  test('ignores empty account IDs from stray commas for a global token', async () => {
+    core.getInput.mockImplementation(mockGetInput({
+      ...ECR_DEFAULT_INPUTS,
+      'registries': '123456789012, ,',
+      'ecr-private-token-type': 'global-token'
+    }));
+    signinMock.on(CreateBearerTokenCommand).resolves({ accessToken: 'global-token' });
+
+    await run();
+
+    expect(core.setFailed).not.toHaveBeenCalled();
+    expect(exec.exec).toHaveBeenCalledTimes(1);
+    expect(exec.exec).toHaveBeenCalledWith(
+      'docker',
+      ['login', '-u', 'AWS', '--password-stdin', 'https://123456789012.dkr.ecr.us-west-2.amazonaws.com'],
+      expect.objectContaining({ input: Buffer.from('global-token\n') }));
+  });
+
+  test('requires a non-empty account ID for a global token', async () => {
+    core.getInput.mockImplementation(mockGetInput({
+      ...ECR_DEFAULT_INPUTS,
+      'registries': ' , ',
+      'ecr-private-token-type': 'global-token'
+    }));
+
+    await run();
+
+    expect(core.setFailed).toHaveBeenCalledWith(
+      "'registries' or 'registry-endpoints' is required for 'global-token'");
+    expect(signinMock.calls()).toHaveLength(0);
+  });
+
+  test('uses an explicit registry hostname for a custom ECR endpoint', async () => {
+    process.env.AWS_ENDPOINT_URL_ECR = 'https://api.ecr.example.com';
+    process.env.AWS_ENDPOINT_URL = 'https://example.com';
+    core.getInput.mockImplementation(mockGetInput({
+      ...ECR_DEFAULT_INPUTS,
+      'registry-endpoints': 'registry.example.com',
+      'ecr-private-token-type': 'global-token'
+    }));
+    signinMock.on(CreateBearerTokenCommand).callsFake(async (input, getClient) => {
+      expect(getClient().config.ignoreConfiguredEndpointUrls).toBe(true);
+      return { accessToken: 'global-token' };
+    });
+
+    await run();
+
+    expect(ecrMock.calls()).toHaveLength(0);
+    expect(exec.exec).toHaveBeenCalledWith(
+      'docker',
+      ['login', '-u', 'AWS', '--password-stdin', 'registry.example.com'],
+      expect.objectContaining({ input: Buffer.from('global-token\n') }));
+  });
+
+  test('rejects a Docker option as a registry endpoint override', async () => {
+    core.getInput.mockImplementation(mockGetInput({
+      ...ECR_DEFAULT_INPUTS,
+      'registry-endpoints': '--help',
+      'ecr-private-token-type': 'global-token'
+    }));
+
+    await run();
+
+    expect(core.setFailed).toHaveBeenCalledWith('Invalid ECR registry hostname: --help');
+    expect(signinMock.calls()).toHaveLength(0);
+    expect(exec.exec).toHaveBeenCalledTimes(0);
+  });
+
+  test('rejects an empty registry endpoint override', async () => {
+    core.getInput.mockImplementation(mockGetInput({
+      ...ECR_DEFAULT_INPUTS,
+      'registry-endpoints': ',',
+      'ecr-private-token-type': 'global-token'
+    }));
+
+    await run();
+
+    expect(core.setFailed).toHaveBeenCalledWith(
+      "'registry-endpoints' does not contain an endpoint");
+    expect(signinMock.calls()).toHaveLength(0);
+  });
+
+  test('requires a registry override with a custom ECR endpoint', async () => {
+    process.env.AWS_ENDPOINT_URL_ECR = 'https://api.ecr.example.com';
+    core.getInput.mockImplementation(mockGetInput({
+      ...ECR_DEFAULT_INPUTS,
+      'registries': '123456789012',
+      'ecr-private-token-type': 'global-token'
+    }));
+
+    await run();
+
+    expect(core.setFailed).toHaveBeenCalledWith(
+      "Cannot derive an ECR registry endpoint from custom SDK endpoint " +
+      "https://api.ecr.example.com; set 'registry-endpoints'");
+    expect(signinMock.calls()).toHaveLength(0);
+  });
+
+  test('requires registries or registry-endpoints for a global token', async () => {
+    core.getInput.mockImplementation(mockGetInput({
+      ...ECR_DEFAULT_INPUTS,
+      'ecr-private-token-type': 'global-token'
+    }));
+
+    await run();
+
+    expect(core.setFailed).toHaveBeenCalledWith(
+      "'registries' or 'registry-endpoints' is required for 'global-token'");
+    expect(signinMock.calls()).toHaveLength(0);
+  });
+
+  test('rejects an account ID that could redirect the global token', async () => {
+    core.getInput.mockImplementation(mockGetInput({
+      ...ECR_DEFAULT_INPUTS,
+      'registries': 'attacker.example/path',
+      'ecr-private-token-type': 'global-token'
+    }));
+    signinMock.on(CreateBearerTokenCommand).resolves({ accessToken: 'global-token' });
+
+    await run();
+
+    expect(core.setFailed).toHaveBeenCalledWith(
+      'Invalid ECR registry account ID: attacker.example/path');
+    expect(signinMock.calls()).toHaveLength(0);
+    expect(exec.exec).toHaveBeenCalledTimes(0);
+  });
+
+  test('rejects global-token when FIPS is enabled', async () => {
+    process.env.AWS_USE_FIPS_ENDPOINT = 'true';
+    core.getInput.mockImplementation(mockGetInput({
+      ...ECR_DEFAULT_INPUTS,
+      'registries': '123456789012',
+      'ecr-private-token-type': 'global-token'
+    }));
+
+    await run();
+
+    expect(core.setFailed).toHaveBeenCalledWith(
+      "'global-token' does not support FIPS endpoints because SignIn CreateBearerToken does not support FIPS");
+    expect(signinMock.calls()).toHaveLength(0);
+  });
+
+  test.each(['automatic', 'GLOBAL-TOKEN'])(
+    'rejects unsupported ECR Private token type value %s',
+    async (tokenType) => {
+      core.getInput.mockImplementation(mockGetInput({
+        ...ECR_DEFAULT_INPUTS,
+        'ecr-private-token-type': tokenType
+      }));
+
+      await run();
+
+      expect(core.setFailed).toHaveBeenCalledWith(
+        "Invalid input for 'ecr-private-token-type', possible options are [regional-token, global-token]");
+      expect(ecrMock.calls()).toHaveLength(0);
+      expect(signinMock.calls()).toHaveLength(0);
+    });
+
+  test('does not infer global-token from an MRE registry hostname', async () => {
+    const mreEndpoint = 'https://g-ABCDEFGHIJ.1234.ecr.global.on.aws';
+    ecrMock.on(GetAuthorizationTokenCommand).resolves({
+      authorizationData: [{
+        authorizationToken: Buffer.from('AWS:regional-token').toString('base64'),
+        proxyEndpoint: mreEndpoint
+      }]
+    });
+
+    await run();
+
+    expect(signinMock.calls()).toHaveLength(0);
+    expect(exec.exec).toHaveBeenCalledWith(
+      'docker',
+      ['login', '-u', 'AWS', '-p', 'regional-token', mreEndpoint],
+      expect.anything());
+  });
+
+  test.each([
+    [null, 'Amazon SignIn bearer token returned no data'],
+    [{}, 'Amazon SignIn bearer token is invalid']
+  ])('rejects an invalid SignIn response', async (response, error) => {
+    core.getInput.mockImplementation(mockGetInput({
+      ...ECR_DEFAULT_INPUTS,
+      'registries': '123456789012',
+      'ecr-private-token-type': 'global-token'
+    }));
+    signinMock.on(CreateBearerTokenCommand).resolves(response);
+
+    await run();
+
+    expect(core.setFailed).toHaveBeenCalledWith(error);
+    expect(exec.exec).toHaveBeenCalledTimes(0);
   });
 
   test('gets auth token from ECR and logins the Docker client for each provided registry', async () => {
@@ -439,6 +796,7 @@ describe('Login to ECR Public', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     ecrPublicMock.reset();
+    signinMock.reset();
 
     core.getInput.mockImplementation(mockGetInput(ECR_PUBLIC_DEFAULT_INPUTS));
 
@@ -477,6 +835,23 @@ describe('Login to ECR Public', () => {
       expect(exec.exec).toHaveBeenCalledTimes(1);
       expect(core.setOutput).toHaveBeenCalledTimes(3);
       expect(core.saveState).toHaveBeenCalledTimes(1);
+    });
+
+    test('ignores ECR Private token type for ECR Public', async () => {
+      core.getInput.mockImplementation(mockGetInput({
+        ...ECR_PUBLIC_DEFAULT_INPUTS,
+        'ecr-private-token-type': 'global-token'
+      }));
+      ecrPublicMock.on(GetAuthorizationTokenCommandPublic).resolves(defaultAuthToken);
+
+      await run();
+
+      expect(signinMock.calls()).toHaveLength(0);
+      expect(ecrPublicMock.commandCalls(GetAuthorizationTokenCommandPublic, {})).toHaveLength(1);
+      expect(exec.exec).toHaveBeenCalledWith(
+        'docker',
+        ['login', '-u', 'hello', '-p', 'world', 'public.ecr.aws'],
+        expect.anything());
     });
 
     test('sets the Actions outputs to the docker credentials', async () => {

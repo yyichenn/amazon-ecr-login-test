@@ -21,12 +21,29 @@ inputs:
       If you do not specify a registry, the default ECR Private registry is assumed.
       If 'public' is given as input to 'registry-type', this input is ignored.
     required: false
+  registry-endpoints:
+    description: >-
+      A comma-delimited list of ECR Private registry hostnames to use with 'global-token'.
+      This overrides hostnames derived from 'registries' and is required for custom ECR endpoints.
+      The global token is sent to each of these hosts, so set only trusted registry hostnames.
+      If 'public' is given as input to 'registry-type', this input is ignored.
+    required: false
   registry-type:
     description: >-
       Which ECR registry type to log into.
       Options: [private, public]
     required: false
     default: private
+  ecr-private-token-type:
+    description: >-
+      Existing workflows are unchanged: without this input, the action uses regional tokens.
+      Set this input to 'global-token' explicitly to use a global token for private ECR registries.
+      With 'global-token', 'registries' or 'registry-endpoints' is required and FIPS endpoints are not supported.
+      Applies to ECR Private registries only.
+      If 'public' is given as input to 'registry-type', this input is ignored.
+      Options: [regional-token, global-token]
+    required: false
+    default: regional-token
   skip-logout:
     description: >-
       Whether to skip explicit logout of the registries during post-job cleanup.

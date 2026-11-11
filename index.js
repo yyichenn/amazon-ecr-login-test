@@ -5,17 +5,23 @@ import { NodeHttpHandler } from '@aws-sdk/node-http-handler';
 import { fromHttp } from '@aws-sdk/credential-providers';
 import { ECRClient, GetAuthorizationTokenCommand } from '@aws-sdk/client-ecr';
 import { ECRPUBLICClient, GetAuthorizationTokenCommand as GetAuthorizationTokenCommandPublic } from '@aws-sdk/client-ecr-public';
+import { SigninClient, CreateBearerTokenCommand } from '@aws-sdk/client-signin';
 import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const ECR_LOGIN_GITHUB_ACTION_USER_AGENT = 'amazon-ecr-login-for-github-actions';
 const ECR_PUBLIC_REGISTRY_URI = 'public.ecr.aws';
+const ECR_REGISTRY_ID_PATTERN = /^\d{12}$/;
+const SIGNIN_GRANT_TYPE = 'client_credentials';
+const SIGNIN_RESOURCE = 'ecr.amazonaws.com';
 
 const INPUTS = {
   httpProxy: 'http-proxy',
   maskPassword: 'mask-password',
   registries: 'registries',
+  registryEndpoints: 'registry-endpoints',
   registryType: 'registry-type',
+  tokenType: 'ecr-private-token-type',
   skipLogout: 'skip-logout'
 };
 
@@ -32,6 +38,11 @@ const STATES = {
 const REGISTRY_TYPES = {
   private: 'private',
   public: 'public'
+};
+
+const TOKEN_TYPES = {
+  regional: 'regional-token',
+  global: 'global-token'
 };
 
 function configureProxy(httpProxy) {
@@ -71,8 +82,8 @@ function getCredentials() {
   return undefined;
 }
 
-async function getEcrAuthTokenWrapper(authTokenRequest, httpsProxyAgent) {
-  const ecrClient = new ECRClient({
+function getEcrClient(httpsProxyAgent) {
+  return new ECRClient({
     customUserAgent: ECR_LOGIN_GITHUB_ACTION_USER_AGENT,
     credentials: getCredentials(), // Added credentials setting
     requestHandler: new NodeHttpHandler({
@@ -80,6 +91,10 @@ async function getEcrAuthTokenWrapper(authTokenRequest, httpsProxyAgent) {
       httpsAgent: httpsProxyAgent
     }),
   });
+}
+
+async function getEcrAuthTokenWrapper(authTokenRequest, httpsProxyAgent) {
+  const ecrClient = getEcrClient(httpsProxyAgent);
   const command = new GetAuthorizationTokenCommand(authTokenRequest);
   const authTokenResponse = await ecrClient.send(command);
   if (!authTokenResponse) {
@@ -91,6 +106,115 @@ async function getEcrAuthTokenWrapper(authTokenRequest, httpsProxyAgent) {
   }
 
   return authTokenResponse;
+}
+
+function getEcrRegistryEndpoint(registryId, ecrApiHostname, useDualstackEndpoint) {
+  // Global mode constructs the Docker target locally, so validate before retrieving a token.
+  if (!ECR_REGISTRY_ID_PATTERN.test(registryId)) {
+    throw new Error(`Invalid ECR registry account ID: ${registryId}`);
+  }
+
+  const expectedPrefix = useDualstackEndpoint ? 'ecr.' : 'api.ecr.';
+  if (!ecrApiHostname.startsWith(expectedPrefix) ||
+      (useDualstackEndpoint && !ecrApiHostname.includes('.api.'))) {
+    throw new Error(
+      `Cannot derive an ECR registry endpoint from SDK endpoint ${ecrApiHostname}; ` +
+      `set '${INPUTS.registryEndpoints}' for a custom endpoint`);
+  }
+
+  if (useDualstackEndpoint) {
+    return `https://${registryId}.dkr-ecr.${ecrApiHostname
+      .slice(expectedPrefix.length)
+      .replace('.api.', '.on.')}`;
+  }
+
+  return `https://${registryId}.dkr.ecr.${ecrApiHostname.slice(expectedPrefix.length)}`;
+}
+
+function getRegistryEndpointOverrides(registryEndpoints) {
+  return registryEndpoints
+    .split(',')
+    .map((endpoint) => endpoint.trim())
+    .filter(Boolean)
+    .map((endpoint) => {
+      // Docker validates server syntax; reject only values it could parse as command options.
+      if (endpoint.startsWith('-')) {
+        throw new Error(`Invalid ECR registry hostname: ${endpoint}`);
+      }
+      return endpoint;
+    });
+}
+
+async function getEcrGlobalAuthTokenWrapper(registryIds, registryEndpointOverrides, httpsProxyAgent) {
+  const ecrClient = getEcrClient(httpsProxyAgent);
+  const region = await ecrClient.config.region();
+  const useFipsEndpoint = await ecrClient.config.useFipsEndpoint();
+  if (useFipsEndpoint) {
+    throw new Error(
+      `'${TOKEN_TYPES.global}' does not support FIPS endpoints because ` +
+      'SignIn CreateBearerToken does not support FIPS');
+  }
+
+  let registryEndpoints;
+  if (registryEndpointOverrides) {
+    registryEndpoints = getRegistryEndpointOverrides(registryEndpointOverrides);
+    if (!registryEndpoints.length) {
+      throw new Error(`'${INPUTS.registryEndpoints}' does not contain an endpoint`);
+    }
+  } else {
+    // Drop empty entries from stray commas, as the override path does.
+    const accountIds = registryIds.map((registryId) => registryId.trim()).filter(Boolean);
+    if (!accountIds.length) {
+      throw new Error(
+        `'${INPUTS.registries}' or '${INPUTS.registryEndpoints}' is required for '${TOKEN_TYPES.global}'`);
+    }
+
+    const configuredEndpoint = await ecrClient.config.serviceConfiguredEndpoint?.();
+    if (configuredEndpoint) {
+      throw new Error(
+        `Cannot derive an ECR registry endpoint from custom SDK endpoint ${configuredEndpoint}; ` +
+        `set '${INPUTS.registryEndpoints}'`);
+    }
+
+    const useDualstackEndpoint = await ecrClient.config.useDualstackEndpoint();
+    const ecrApiEndpoint = await ecrClient.config.endpointProvider({
+      Region: region,
+      UseFIPS: useFipsEndpoint,
+      UseDualStack: useDualstackEndpoint
+    });
+    registryEndpoints = accountIds.map(
+      (accountId) => getEcrRegistryEndpoint(
+        accountId, ecrApiEndpoint.url.hostname, useDualstackEndpoint));
+  }
+
+  const signinClient = new SigninClient({
+    customUserAgent: ECR_LOGIN_GITHUB_ACTION_USER_AGENT,
+    credentials: getCredentials(),
+    ignoreConfiguredEndpointUrls: true,
+    region,
+    requestHandler: new NodeHttpHandler({
+      httpAgent: httpsProxyAgent,
+      httpsAgent: httpsProxyAgent
+    }),
+  });
+  const command = new CreateBearerTokenCommand({
+    grantType: SIGNIN_GRANT_TYPE,
+    resource: SIGNIN_RESOURCE
+  });
+  const bearerTokenResponse = await signinClient.send(command);
+  if (!bearerTokenResponse) {
+    throw new Error('Amazon SignIn bearer token returned no data');
+  } else if (!bearerTokenResponse.accessToken) {
+    throw new Error('Amazon SignIn bearer token is invalid');
+  }
+
+  return {
+    authorizationData: registryEndpoints.map((proxyEndpoint) => ({
+      username: 'AWS',
+      password: bearerTokenResponse.accessToken,
+      proxyEndpoint
+    }))
+  };
 }
 
 async function getEcrPublicAuthTokenWrapper(authTokenRequest, httpsProxyAgent) {
@@ -133,7 +257,9 @@ async function run() {
   const httpProxy = core.getInput(INPUTS.httpProxy, { required: false });
   const maskPassword = (core.getInput(INPUTS.maskPassword, { required: false }).toLowerCase() || 'true') !== 'false';
   const registries = core.getInput(INPUTS.registries, { required: false });
+  const registryEndpoints = core.getInput(INPUTS.registryEndpoints, { required: false });
   const registryType = core.getInput(INPUTS.registryType, { required: false }).toLowerCase() || REGISTRY_TYPES.private;
+  const tokenType = core.getInput(INPUTS.tokenType, { required: false }) || TOKEN_TYPES.regional;
   const skipLogout = core.getInput(INPUTS.skipLogout, { required: false }).toLowerCase() === 'true';
 
   const registryUriState = [];
@@ -141,6 +267,13 @@ async function run() {
   try {
     if (registryType !== REGISTRY_TYPES.private && registryType !== REGISTRY_TYPES.public) {
       throw new Error(`Invalid input for '${INPUTS.registryType}', possible options are [${REGISTRY_TYPES.private}, ${REGISTRY_TYPES.public}]`);
+    }
+    const useGlobalToken = registryType === REGISTRY_TYPES.private &&
+      tokenType === TOKEN_TYPES.global;
+    if (registryType === REGISTRY_TYPES.private &&
+        tokenType !== TOKEN_TYPES.regional &&
+        !useGlobalToken) {
+      throw new Error(`Invalid input for '${INPUTS.tokenType}', possible options are [${TOKEN_TYPES.regional}, ${TOKEN_TYPES.global}]`);
     }
 
     // Notify customer if they don't have their password masked
@@ -154,22 +287,30 @@ async function run() {
 
     // Get the ECR/ECR Public authorization token(s)
     const authTokenRequest = {};
+    let registryIds = [];
     if (registryType === REGISTRY_TYPES.private && registries) {
-      const registryIds = registries.split(',');
-      core.debug(`Requesting auth token for ${registryIds.length} registries:`);
+      registryIds = registries.split(',');
+      core.debug(`${useGlobalToken ? 'Preparing login for' : 'Requesting auth token for'} ${registryIds.length} registries:`);
       for (const id of registryIds) {
         core.debug(`  '${id}'`);
       }
       authTokenRequest.registryIds = registryIds;
     }
-    const authTokenResponse = registryType === REGISTRY_TYPES.private ?
-      await getEcrAuthTokenWrapper(authTokenRequest, httpsProxyAgent) :
-      await getEcrPublicAuthTokenWrapper(authTokenRequest, httpsProxyAgent);
+    let authTokenResponse;
+    if (registryType === REGISTRY_TYPES.public) {
+      authTokenResponse = await getEcrPublicAuthTokenWrapper(authTokenRequest, httpsProxyAgent);
+    } else if (useGlobalToken) {
+      authTokenResponse = await getEcrGlobalAuthTokenWrapper(
+        registryIds, registryEndpoints, httpsProxyAgent);
+    } else {
+      authTokenResponse = await getEcrAuthTokenWrapper(authTokenRequest, httpsProxyAgent);
+    }
 
     // Login to each registry
     for (const authData of authTokenResponse.authorizationData) {
-      const authToken = Buffer.from(authData.authorizationToken, 'base64').toString('utf-8');
-      const creds = authToken.split(':', 2);
+      const creds = useGlobalToken
+        ? [authData.username, authData.password]
+        : Buffer.from(authData.authorizationToken, 'base64').toString('utf-8').split(':', 2);
       const proxyEndpoint = authData.proxyEndpoint;
       const registryUri = proxyEndpoint.replace(/^https?:\/\//, '');
 
@@ -180,10 +321,18 @@ async function run() {
         core.setOutput(OUTPUTS.registry, registryUri);
       }
 
+      if (useGlobalToken && maskPassword) {
+        core.setSecret(creds[1]);
+        core.debug('Your docker password is masked.');
+      }
+
       // Execute the docker login command
       let doLoginStdout = '';
       let doLoginStderr = '';
-      const exitCode = await exec.exec('docker', ['login', '-u', creds[0], '-p', creds[1], proxyEndpoint], {
+      const dockerArguments = useGlobalToken
+        ? ['login', '-u', creds[0], '--password-stdin', proxyEndpoint]
+        : ['login', '-u', creds[0], '-p', creds[1], proxyEndpoint];
+      const dockerOptions = {
         silent: true,
         ignoreReturnCode: true,
         listeners: {
@@ -194,7 +343,11 @@ async function run() {
             doLoginStderr += data.toString();
           }
         }
-      });
+      };
+      if (useGlobalToken) {
+        dockerOptions.input = Buffer.from(`${creds[1]}\n`);
+      }
+      const exitCode = await exec.exec('docker', dockerArguments, dockerOptions);
       if (exitCode !== 0) {
         core.debug(doLoginStdout);
         throw new Error(`Could not login to registry ${registryUri}: ${doLoginStderr}`);
@@ -202,7 +355,7 @@ async function run() {
 
       // Output docker username and password
       const secretSuffix = replaceSpecialCharacters(registryUri);
-      if (maskPassword) {
+      if (!useGlobalToken && maskPassword) {
         core.setSecret(creds[1]);
         core.debug('Your docker password is masked.');
       }
@@ -227,6 +380,7 @@ async function run() {
 
 export {
   configureProxy,
+  getEcrRegistryEndpoint,
   getCredentials,
   run,
   replaceSpecialCharacters
