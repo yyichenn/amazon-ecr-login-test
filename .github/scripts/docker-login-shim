@@ -3,8 +3,13 @@ set -euo pipefail
 
 case "${1:-}" in
   login)
-    IFS= read -r password
-    test -n "$password"
+    for argument in "$@"; do
+      if [ "$argument" = "--password-stdin" ]; then
+        IFS= read -r password
+        test -n "$password"
+        break
+      fi
+    done
     ;;
   logout)
     ;;
