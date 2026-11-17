@@ -116,7 +116,8 @@ jobs:
           const password = process.env.GLOBAL_PASSWORD || '';
           const registry = process.env.GLOBAL_REGISTRY;
           const parts = password.split('.');
-          const hasExpectedPrefix = password.startsWith('pv_');
+          const hasExpectedPrefix = password.startsWith('eyJ');
+          let payload;
 
           if (username !== 'AWS') {
             throw new Error(`Unexpected Docker username: ${username}`);
@@ -127,11 +128,19 @@ jobs:
           if (!hasExpectedPrefix || parts.length !== 3) {
             throw new Error('Global Docker password is not the expected SignIn bearer-token form.');
           }
+          try {
+            payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+          } catch {
+            throw new Error('Global Docker password has an invalid JWT payload.');
+          }
+          if (typeof payload.sub !== 'string' || payload.sub.length === 0) {
+            throw new Error('Global Docker password JWT has no subject.');
+          }
 
           console.log(
             `global_credential_form=username=AWS registry=${registry} ` +
-            `token_family=signin-bearer-jwt prefix=pv_ prefix_length=3 ` +
-            `token_length=${password.length} jwt_segments=${parts.length}`
+            `token_family=signin-access-token-jwt prefix=eyJ prefix_length=3 ` +
+            `token_length=${password.length} jwt_segments=${parts.length} subject=present`
           );
           NODE
 
