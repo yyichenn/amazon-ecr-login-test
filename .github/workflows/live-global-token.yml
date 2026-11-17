@@ -1,0 +1,145 @@
+# Test-only workflow for the unreleased upstream main artifact.
+name: Live upstream main ECR token paths
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  live-test:
+    name: ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ECR_ACCOUNT: '277125094980'
+      ECR_REGISTRY: 277125094980.dkr.ecr.us-west-2.amazonaws.com
+      ECR_IMAGE: 277125094980.dkr.ecr.us-west-2.amazonaws.com/repro-k8s-global-token-cross-region-20261008:repro-global-token-20261008
+      TEST_ROLE: arn:aws:iam::277125094980:role/ecr-login-mainline-live-test-20261117
+
+    steps:
+      - name: Ensure no Docker login before control
+        shell: bash
+        run: docker logout "$ECR_REGISTRY" || true
+
+      - name: 'Control: pull without login must fail'
+        id: control_pull
+        continue-on-error: true
+        shell: bash
+        run: docker pull "$ECR_IMAGE"
+
+      - name: Assert control pull failed
+        if: always()
+        shell: bash
+        env:
+          CONTROL_OUTCOME: ${{ steps.control_pull.outcome }}
+        run: |
+          if [ "$CONTROL_OUTCOME" != "failure" ]; then
+            echo "Expected the pull without Docker login to fail; outcome was $CONTROL_OUTCOME." >&2
+            exit 1
+          fi
+          echo "Control behaved as expected: unauthenticated pull failed."
+
+      - name: Logout between control and default lanes
+        if: always()
+        shell: bash
+        run: docker logout "$ECR_REGISTRY" || true
+
+      - name: Configure AWS credentials for default lane
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ env.TEST_ROLE }}
+          role-session-name: ecr-login-main-default-20261117
+          aws-region: us-west-2
+
+      - name: Login with default token type
+        uses: aws-actions/amazon-ecr-login@35dfb302061979936da5cef0093650c138c4d3c9
+        with:
+          registries: ${{ env.ECR_ACCOUNT }}
+
+      - name: Pull with default token type
+        shell: bash
+        run: docker pull "$ECR_IMAGE"
+
+      - name: Logout between default and explicit regional lanes
+        if: always()
+        shell: bash
+        run: docker logout "$ECR_REGISTRY" || true
+
+      - name: Configure AWS credentials for explicit regional lane
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ env.TEST_ROLE }}
+          role-session-name: ecr-login-main-regional-20261117
+          aws-region: us-west-2
+
+      - name: Login with explicit regional token
+        uses: aws-actions/amazon-ecr-login@35dfb302061979936da5cef0093650c138c4d3c9
+        with:
+          registries: ${{ env.ECR_ACCOUNT }}
+          ecr-private-token-type: regional-token
+
+      - name: Pull with explicit regional token
+        shell: bash
+        run: docker pull "$ECR_IMAGE"
+
+      - name: Logout between explicit regional and global lanes
+        if: always()
+        shell: bash
+        run: docker logout "$ECR_REGISTRY" || true
+
+      - name: Configure AWS credentials for global lane
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ env.TEST_ROLE }}
+          role-session-name: ecr-login-main-global-20261117
+          aws-region: us-west-2
+
+      - name: Login with global token
+        id: global
+        uses: aws-actions/amazon-ecr-login@35dfb302061979936da5cef0093650c138c4d3c9
+        with:
+          registries: ${{ env.ECR_ACCOUNT }}
+          ecr-private-token-type: global-token
+
+      - name: Confirm global Docker credential form without printing it
+        shell: bash
+        env:
+          GLOBAL_USERNAME: ${{ steps.global.outputs.docker_username_277125094980_dkr_ecr_us_west_2_amazonaws_com }}
+          GLOBAL_PASSWORD: ${{ steps.global.outputs.docker_password_277125094980_dkr_ecr_us_west_2_amazonaws_com }}
+          GLOBAL_REGISTRY: ${{ steps.global.outputs.registry }}
+        run: |
+          node <<'NODE'
+          const username = process.env.GLOBAL_USERNAME;
+          const password = process.env.GLOBAL_PASSWORD || '';
+          const registry = process.env.GLOBAL_REGISTRY;
+          const parts = password.split('.');
+          const hasExpectedPrefix = password.startsWith('pv_');
+
+          if (username !== 'AWS') {
+            throw new Error(`Unexpected Docker username: ${username}`);
+          }
+          if (registry !== '277125094980.dkr.ecr.us-west-2.amazonaws.com') {
+            throw new Error(`Unexpected registry output: ${registry}`);
+          }
+          if (!hasExpectedPrefix || parts.length !== 3) {
+            throw new Error('Global Docker password is not the expected SignIn bearer-token form.');
+          }
+
+          console.log(
+            `global_credential_form=username=AWS registry=${registry} ` +
+            `token_family=signin-bearer-jwt prefix=pv_ prefix_length=3 ` +
+            `token_length=${password.length} jwt_segments=${parts.length}`
+          );
+          NODE
+
+      - name: Pull with global token
+        shell: bash
+        run: docker pull "$ECR_IMAGE"
+
+      - name: Logout after global lane
+        if: always()
+        shell: bash
+        run: docker logout "$ECR_REGISTRY" || true
